@@ -1,0 +1,32 @@
+{#
+See also comment in dropwizard-upstream.jinja.
+
+We create a proxy_pass URL for each service in ZK. URL will proxy all requests to a respective service instance.
+E.g: call to /test/myservice/ will call (and failover/loadballance) service instances of myservice that are registered in zookeeper in /test/service/myservice/*
+
+Example output:
+
+location /test/myservice/ {
+	proxy_pass http://myservice-test/;
+}
+
+After generating output file from this template, include it in the "server {}" section in the main nginx.conf file.
+e.g:
+server {
+	listen      80;
+	include		/etc/nginx/dropwizard-upstream.conf
+	...
+}
+
+This is jinja comment and it will be removed automatically during the templating.
+#}
+
+{%- for zk_watch_path in ZK_TREE -%}
+{% set env = zk_watch_path.split('/')[1] %}
+{% for svcname in ZK_TREE[zk_watch_path] -%}
+location /{{env}}/{{svcname}}/ {
+	proxy_pass http://{{svcname}}-{{env}}/;
+}
+
+{% endfor %}
+{% endfor %}

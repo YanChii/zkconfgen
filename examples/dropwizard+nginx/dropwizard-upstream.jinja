@@ -1,0 +1,44 @@
+{#
+Dropwizard keeps ephemeral instance nodes in zookeeper tree as /<env>/service/<svc_name>/<instances+data>
+Example: /test/service/myservice/b4eaecea-99e5-4f14-8c53-e35adb34bcd2
+We'll sort services according to the {{env}} and also add a suffix of "-{{env}}" to all service names.
+
+ZK_TREE variable is a python (ordered) dict that contains zk_watch_paths from the ini file as its base keys. 
+Under that keys, there is whole respective zookeeper tree.
+
+E.g: to access a content of the node /test/service/myservice/b4eaecea-99e5-4f14-8c53-e35adb34bcd2 when the
+ini file "zk_watch_paths" variable includes the "/test/service" path:
+{{ZK_TREE['/test/service']['myservice']['b4eaecea-99e5-4f14-8c53-e35adb34bcd2']}}
+data in this node is further json encoded and is decoded automatically for you. Access it as an underlying dict.
+
+E.g.2: get dropwizard IP address for node /test/service/myservice/b4eaecea-99e5-4f14-8c53-e35adb34bcd2
+{{ZK_TREE['/test/service']['myservice']['b4eaecea-99e5-4f14-8c53-e35adb34bcd2']['payload']['listenAddress']}}
+Variables "payload" and "listenAddress" are dropwizard-specific. But we know they're there so we can
+safely use them. You can experiment a bit and maybe print the whole ZK_TREE so you can see the raw data.
+
+We get {{env}} variable from the zk_watch_path (notice the singular - we get one path at a time) 
+by parsing the path (e.g: /test/service -> "test").
+Remark: If you set any addtitional *regex_path in the ini file, the ZK_TREE may not contain
+all the paths from zk_watch_paths.
+
+After generating output file from this template, include it in the "http {}" section in the main nginx.conf file.
+e.g:
+http {
+	include /etc/nginx/dropwizard-location.conf
+	...
+}
+
+This is jinja comment and it will be removed automatically during the templating.
+#}
+
+{%- for zk_watch_path in ZK_TREE -%}
+{% set env = zk_watch_path.split('/')[1] %}
+{% for svcname in ZK_TREE[zk_watch_path] -%}
+upstream {{svcname}}-{{env}} {
+{%- for svcinstance in ZK_TREE[zk_watch_path][svcname] %}
+        server {{ZK_TREE[zk_watch_path][svcname][svcinstance]['payload']['listenAddress']}}:{{ZK_TREE[zk_watch_path][svcname][svcinstance]['payload']['listenPort']}};			# registered at: {{ZK_TREE[zk_watch_path][svcname][svcinstance]['registrationTimeUTC']}}
+{%- endfor %}
+}
+
+{% endfor %}
+{% endfor %}

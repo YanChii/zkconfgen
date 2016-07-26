@@ -1,0 +1,47 @@
+{#
+This template is altered dropwizard-upstream.jinja. It requires special variable defined in ini file {{PUSHENV.SVCURLS}}
+that contains a list of allowed URLs that will be proxied.
+
+Example output with this config:
+	pushenv = SVCURLS:/my/allowed/url;/next/allowed/url
+	includepath_regex = /[^/]+/service/securesvc/
+
+
+location /prod/securesvc/my/allowed/url {
+	proxy_pass https://securesvc-prod/my/allowed/url;
+}
+
+location /prod/securesvc/next/allowed/url {
+	proxy_pass https://securesvc-prod/next/allowed/url;
+}
+
+location /test/securesvc/my/allowed/url {
+	proxy_pass https://securesvc-test/my/allowed/url;
+}
+
+location /test/securesvc/next/allowed/url {
+	proxy_pass https://securesvc-test/next/allowed/url;
+}
+
+
+After generating output file from this template, include it in the "server {}" section in the main nginx.conf file.
+e.g:
+server {
+	listen      80;
+	include		/etc/nginx/dropwizard-upstream-esign.conf
+	...
+}
+
+This is jinja comment and it will be removed automatically during the templating.
+#}
+
+{%- for zk_watch_path in ZK_TREE -%}
+{% set env = zk_watch_path.split('/')[1] %}
+{% for svcname in ZK_TREE[zk_watch_path] -%}
+{% for svcurl in PUSHENV.SVCURLS.split(';') %}
+location /{{env}}/{{svcname}}{{svcurl}} {
+	proxy_pass https://{{svcname}}-{{env}}{{svcurl}};
+}
+{% endfor %}
+{% endfor %}
+{% endfor %}

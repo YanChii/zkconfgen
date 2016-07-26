@@ -1,0 +1,13 @@
+{# Dropwizard keeps ephemeral instance nodes in zookeeper tree as /<env>/service/<svc_name>/<instances+data>
+Example: /test/service/myservice/b4eaecea-99e5-4f14-8c53-e35adb34bcd2
+We'll split services according to env and add -{{env}} to the service names. #}
+
+{% set env = PUSHENV.USE_ENV %}
+{% for svcname in ZK_TREE[env] -%}
+upstream {{svcname}}-{{env}} {
+{%- for svcinstance in ZK_TREE[env][svcname] %}
+        server {{ZK_TREE[env][svcname][svcinstance]['payload']['listenAddress']}}:{{ZK_TREE[env][svcname][svcinstance]['payload']['listenPort']}};
+{%- endfor %}
+}
+
+{% endfor %}

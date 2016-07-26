@@ -1,0 +1,17 @@
+[Unit]
+Description=Daemon that generates configs from Zookeeper nodes using templates
+;After=network.target
+;After=systemd-journald.service
+
+[Service]
+WorkingDirectory=/etc/zkconfgen
+ExecStart=/usr/bin/zkconfgen -c /etc/zkconfgen/zkconfgen.ini
+ExecReload=/bin/kill -USR1 $MAINPID
+Type=simple
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+Restart=on-abort
+
+[Install]
+WantedBy=multi-user.target

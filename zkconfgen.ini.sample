@@ -1,0 +1,173 @@
+[main]
+# zk_servers:
+# Comma-separated list of zookeeper servers. The servers must 
+# be in the same cluster. IP addresses are recommended over DNS names.
+# Default: 127.0.0.1
+# Example:
+# zk_servers = 10.20.30.40,20.30.40.50,100.200.1.1
+#zk_servers = zk.ip.addrs.here
+
+# zk_timeout:
+# Number of seconds that ZK server waits before dropping unresponsive 
+# client and deleting all his ephemeral nodes and locks. Lower values
+# get faster responses on network problems but setting it too low
+# may cause unnecessary disconnects during network latency fluctuations.
+# I recommend setting it to the same value as the registering nodes.
+# Default: 5
+#zk_timeout = 5
+
+# zk_watch_paths:
+# What ZK paths should be watched. Under this path(s) the program expects
+# to find this structure:
+# <zk_watch_path>/<svc_name>/<instances_with_data>
+# Example:
+# zk_watch_paths = /dev/service, /test/service/,/prod/service
+# Required.
+# No default value.
+zk_watch_paths = /prod/service,/test/service,/dev/service
+
+# include_empty:
+# Include service names without active instances in the final listing.
+# E.g: if include_empty = 0 and
+# node /dev/services/myservice/ has no subnodes, myservice will
+# not be included in svlist variable. As a consequence, your jinja
+# template will not generate backend server groups with no members
+# as it is known to break some configurations (e.g. nginx upstream
+# clause with no upstream servers).
+# Allowed values: 0, 1, True, False
+# default: false
+#include_empty = False
+
+# logfile:
+# Default: /var/log/zkconfgen.log
+# To turn off logging to file, set this variable to empty value.
+#logfile = /var/log/zkconfgen.log
+
+# log_to_syslog:
+# Default: True
+# Allowed values: 0, 1, False, True
+#log_to_syslog = False
+
+# debug_level:
+# Increase debug level.
+# Possible levels:
+# 0     CRIT        App unusable. Call to end application ASAP.
+# 1     WARN        App unstable, but probably we can still continue.
+# 2     INFO        Things are going as they should.
+# 3     DEBUG       More info about what's happening. Output diffs included.
+# 4     TRACE1      Even more info, dump important variables.
+# 5     TRACE2      Dump also variables in loops (= print a lot of data).
+# Allowed values: 0 - 5
+# Default: 1 (WARN + CRIT)
+debug_level = 2
+
+# checkconf_command:
+# If this command is defined and it returns a non-zero value,
+# reload_command will not be run. Can be defined also without
+# the reload_command.
+# Default: none
+# Example:
+# checkconf_command = /sbin/nginx -c /etc/nginx/nginx.conf -t
+#checkconf_command = 
+
+# reload_command:
+# Command to run after successful config write. The command is run only after 
+# all cfg files are written. If not defined, no command is run after cfg write.
+# Default: none
+# Example:
+# reload_command = /sbin/nginx -s reload
+#reload_command = 
+
+# wait_before_reload:
+# How many seconds to wait before calling the reload_command. Use this to prevent
+# too frequent reloads after multiple changes in ZK tree in the short time.
+# With non-zero (integer) value, the reloads can (of course) inherit multiple accummulated changes. 
+# The app will be reloaded at most every "wait_before_reload" seconds.
+# The value of zero (0) disables the functionality and any change in ZK tree
+# immediately triggers the reload_command.
+# Default: 1
+#wait_before_reload = 1
+
+# reload_command_timeout:
+# Use timeout when running reload_command and checkconf_command.
+# We send TERM signal after reload_command_timeout and KILL signal
+# after additional reload_command_timeout seconds if the program does not cooperate.
+# Therefore command can run at most 2*reload_command_timeout seconds.
+# For this feature to be functional, the executable "timeout" (from coreutils)
+# must be within system PATH.
+# Timeout is in seconds. Turn the timeout off by setting to zero (0).
+# Default: 10	(seconds)
+#reload_command_timeout = 0
+
+
+# Generated files sections.
+# Each section (enclosed in [...]) means one generated file. The sections 
+# can have diferrent source templates, can modify generated nodelist using
+# includepath_regex/excludepath_regex and finally it be written to a custom file.
+# All sections begin with the same nodelist received from ZK, 
+# the only list modifiers are includepath_regex/excludepath_regex.
+# If include is defined, then only these services are included (if they exist
+# in the ZK). Then exclude is applied an subtracts from {{nodelist}}.
+# In other words:
+# Node exists in final list if it exists in ZK AND is enlisted in includes
+# (if include defined) AND is not enlisted in excludes.
+# Excludes take precedence over includes.
+# Required values: infile, outfile
+# Optional values: includepath_regex, excludepath_regex, PUSHENV
+# Number of file sections is unlimited.
+# Reload command is called only after all files are checked/writen.
+[file1]
+# Example:
+#infile = /etc/zkconfgen/templates/mytemplate.jinja
+#outfile = /etc/myconf.conf
+# For more info see examples directory or https://github.com/YanChii/zkconfgen
+infile = 
+outfile = 
+
+# PUSHENV:
+# Push custom variables to the templating engine. These variables can be
+# referenced in infile as {{PUSHENV.varname}}.
+# Example: to declare variable MYVAR with value ov "dev":
+# PUSHENV = MYVAR:dev
+# reference in the template as {{PUSHENV.MYVAR}}.
+# Example syntax: VAR1:value, VAR2:multi word value,VAR3 :value3
+# Multiple values are separated by commas. Spaces are trimmed
+# (except in values).
+# Please note that colons (:) and commas (,) are not allowed in values!
+# Example:
+# PUSHENV = MYVAR:test, USE_ENV:/dev/service
+# Default value: none
+#PUSHENV = 
+
+# includepath_regex, excludepath_regex:
+# These regex variables filter the paths that are allowed to go to 
+# the templating engine. With their proper use you can reuse the
+# same templates (infile) and still get what you need.
+# Includepath_regex reduces the paths to listed ones. If the path 
+# does not match the includepath, it will be dropped for this template.
+# Excludepath_regex further reduces the paths. If path matches both
+# include and exclude matches, the exclude takes precedense.
+# You can use these *regex matches separately one from another or together.
+# Matching is done as a plain path match.
+# The matched path contains only <zk_watch_path> and <svc_name>
+# (so no instances). E.g: /dev/service/myservice.
+# Notice that regex "/dev/service/myservice/" will not match any service
+# even when "myservice" exists because there's no slash after service names
+# in this particular filter. This is correct filter for myservice:
+# includepath_regex = /dev/service/myservice
+# Another examples:
+# If the first ZK "directory" item represents env, include all envs:
+# includepath_regex = /[^/]+/service
+# Include all dev and test services and from prod only those, whose names
+# beginning with "reg":
+# includepath_regex = /dev/service|/test/service|/prod/service/reg
+# Exclude specific services:
+# excludepath_regex = /dev/service/(r.*|teller|calc|nonexistentsvc)
+# Default value: none
+#includepath_regex = 
+#excludepath_regex = 
+
+#[file2]
+#infile = 
+#outfile = 
+

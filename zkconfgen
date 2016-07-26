@@ -1,0 +1,749 @@
+#!/bin/env python
+# (c) YanChii
+# github: YanChii/zkconfgen
+
+# Default values:
+DEFAULTCFGVALS = {}
+DEFAULTCFGVALS['config'] = '/etc/zkconfgen/zkconfgen.ini'
+DEFAULTCFGVALS['zk_servers'] = '127.0.0.1'
+DEFAULTCFGVALS['zk_timeout'] = 5
+DEFAULTCFGVALS['include_empty'] = False
+DEFAULTCFGVALS['debug_level'] = 1
+DEFAULTCFGVALS['wait_before_reload'] = 1
+DEFAULTCFGVALS['reload_command_timeout'] = 10
+DEFAULTCFGVALS['PUSHENV'] = ''              # no additional env in templating engine by default
+DEFAULTCFGVALS['log_to_syslog'] = True
+DEFAULTCFGVALS['logfile'] = '/var/log/zkconfgen.log'
+
+import json
+import datetime
+import gevent
+from jinja2 import Template #,Environment
+import jinja2.exceptions
+import difflib
+import signal
+import os
+from sys import stdout, exc_info
+import re
+import copy
+from collections import OrderedDict
+import configparser
+import subprocess
+import shlex
+
+from kazoo.client import (KazooClient, KazooState)
+from kazoo.exceptions import (KazooException, NoNodeError, ConnectionClosedError, OperationTimeoutError, ConnectionLossException)
+try:
+    from kazoo.handlers.threading import KazooTimeoutError
+except ImportError:
+    # v2.1 and lower
+    from kazoo.handlers.threading import TimeoutError
+#from kazoo.handlers.gevent import SequentialGeventHandler
+
+
+# Read cmd line arguments
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('-c', '--config', help='program configuration file (default: ' + DEFAULTCFGVALS['config'] + ')', required=False, default=DEFAULTCFGVALS['config'])
+parser.add_argument('-z', '--zk-servers', help='zookeeper servers to connect to (default: ' + DEFAULTCFGVALS['zk_servers'] + ')', required=False)
+parser.add_argument('-d', '--debug_level', help="increase output verbosity", type=int, required=False, default=None)
+parser.add_argument('-l', '--logfile', help="specify output logfile (default: %s)" % DEFAULTCFGVALS['logfile'], required=False, default=None)
+parser.add_argument('--reload_command', help="command that is run after generating changed output file(s)", required=False, default=None)
+parser.add_argument('--checkconf_command', help="command that is run before reload_command to check consistency of newly generated files (e.g: nginx -t)", required=False, default=None)
+args = parser.parse_args()
+
+
+
+# internal variables:
+config = False              # parsed file configuration
+zk = False                  # ZK connection handle
+CURRENT_ZK_VIEW = False     # final dict that is used to generate outfiles (should be always in sync with remote zk tree.. using zk triggers)
+RELOAD_SCHEDULED = False    # whether reload_command is already scheduled after cfg change
+RELOAD_NEEDED = False       # have the outfiles changed during reload_command run? if True, reload again
+RELOAD_RUNNING = False
+scheduled_calls_count = 0   # count of ZK get_children_async calls in queue
+DEBUG_LEVEL = DEFAULTCFGVALS['debug_level']     # will adjust this later after config read
+CFG_SPECIAL = {}            # preprocessed values from cfg so we don't have to compute them every use
+logger = False              # log handler
+
+# Functions definitions:
+
+# return config value
+# order of precenense: preprocessed conf values, cmd line args, config file, default value, fail and exit
+def getconf(conf_item, section='main'):
+    if conf_item in CFG_SPECIAL:
+        return CFG_SPECIAL[conf_item]
+    elif conf_item in args and vars(args)[conf_item] != None:     # None means that argument was not specified in cmd line
+        return vars(args)[conf_item]
+    elif conf_item in config[section]:
+        return config[section][conf_item]
+    elif conf_item in DEFAULTCFGVALS:
+        return DEFAULTCFGVALS[conf_item]
+    else:
+        logline(0, 'Config value "%s" not specified in file %s or in commandline (and no default value available). Exiting.' % (conf_item, getconf('config')))
+        harakiri()
+
+def item_is_in_config(conf_item, section='main'):
+    if      (conf_item in CFG_SPECIAL or
+            (conf_item in args and vars(args)[conf_item] != None) or
+            conf_item in config[section] or
+            conf_item in DEFAULTCFGVALS):
+        return True
+    else:
+        return False
+
+def read_my_config():
+    if not os.access(args.config, os.R_OK):
+        logline(0, "Config file " + args.config + " is not readable! Exiting..")
+        harakiri()
+    global config
+    config = configparser.ConfigParser()
+    config.read(args.config)
+    
+    # check for required items in all sections
+    required_items = ['infile', 'outfile']
+    for item in required_items:
+        FILESECTIONS = config.sections()
+        FILESECTIONS.remove('main')         # don't look into main section
+        for section in FILESECTIONS:
+            if item not in config[section]:
+                logline(0, 'Config file read error. Item "%s" not found in section [%s]. Exiting.' % (item, section))
+                harakiri()
+
+    global DEBUG_LEVEL
+    DEBUG_LEVEL = int(getconf('debug_level'))
+
+    # here is place to process special variables. These variables will be used in getconf above the original ones from cfg. Their values are recomputed after cfg reload.
+    global CFG_SPECIAL
+    if 'zk_watch_paths' not in config['main']:
+        logline(0, 'Config value "zk_watch_paths" not specified in cfg file %s. Please specify at least one path in zookeeper so we can do something. Now I\'m going to exit.' % getconf('config'))
+        harakiri()
+    # split zk_watch_paths to list and remove unneeded spaces, trailing slashes and empty values
+    CFG_SPECIAL['zk_watch_paths']=[x for x in re.sub(r' *, *|/ *, *|/$', r',', config['main']['zk_watch_paths']).split(',') if x]
+
+    # convert this items to bool
+    if 'include_empty' in config['main']:
+        CFG_SPECIAL['include_empty'] = config['main'].getboolean('include_empty')
+    elif 'include_empty' in CFG_SPECIAL:
+        # if it disappeared from cfg file, delete it also from CFG_SPECIAL
+        del CFG_SPECIAL['include_empty']
+
+    if 'log_to_syslog' in config['main']:
+        CFG_SPECIAL['log_to_syslog'] = config['main'].getboolean('log_to_syslog')
+    elif 'log_to_syslog' in CFG_SPECIAL:
+        del CFG_SPECIAL['log_to_syslog']
+
+    # if "timeout" program is available, use it for providing timeout when running reload_command and checkconf_command
+    timeout_program = find_executable_in_path('timeout')
+    if int(getconf('reload_command_timeout')) <= 0:
+        # timeout turned off
+        CFG_SPECIAL['timeout_command'] = False
+    elif timeout_program == None:
+        logline(2, 'Program "timeout" was not found in PATH. We will run reload_command without timeout.')
+        CFG_SPECIAL['timeout_command'] = False
+    else:
+        logline(3, 'Timeout program found at %s' % timeout_program)
+        CFG_SPECIAL['timeout_command'] = timeout_program
+    
+
+def end(exitval):
+    if zk:
+        zk.stop()
+        zk.close()
+    exit(exitval)
+
+def harakiri():
+    os.kill(os.getpid(), signal.SIGUSR2)
+
+### LOGGING FUNCTIONS START ###
+# LOGLEVELS:
+loglevels = {}
+loglevels[0] = 'CRIT'       # App unusable. Call to end application ASAP.
+loglevels[1] = 'WARN'       # App unstable, but probably we can still continue.
+loglevels[2] = 'INFO'       # Things are going as they should.
+loglevels[3] = 'DEBUG'      # More info about what's happening. Output diffs included.
+loglevels[4] = 'TRACE1'     # Even more info, dump important variables.
+loglevels[5] = 'TRACE2'     # Dump also variables in cycles (= print a lot of data).
+
+def init_logging():
+    # log handling
+    global logger
+    import logging
+    #logging.basicConfig(format='%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S %p')
+    if getconf('log_to_syslog'):
+        logging.basicConfig(format='%(message)s')
+    logfile = getconf('logfile')
+    if logfile:
+        if not os.access(logfile, os.W_OK):
+            try:
+                # test open logfile
+                file = open(logfile, 'w')
+                file.close()
+            except:
+                logline(0, 'Cannot open logfile for write ' + logfile)
+                exit(1)
+        logger = logging.getLogger('zkconfgen')
+        hdlr = logging.FileHandler(logfile)
+        formatter = logging.Formatter(fmt='%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        hdlr.setFormatter(formatter)
+        logger.addHandler(hdlr)
+        logger.setLevel(logging.INFO)
+
+def logline(severity, text):
+    if severity <= DEBUG_LEVEL:
+        try:
+            if logger:
+                logger.info("%s: %s" % (loglevels[severity], text))
+            else:
+                print "%s %s: %s" % (str(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')), loglevels[severity], text)
+            #logger.info("%s %s: %s" % (str(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')), loglevels[severity], text))
+        except KeyError:
+            logline(0, 'Invalid loglevel specified (%s) for message: %s' % (str(severity), text))
+
+### LOGGING FUNCTIONS END ###
+
+def init_signals():
+    # signal handling
+    def ctrl_c(signal, frame):
+        logline(1, 'Interrupt received. Exiting..')
+        end(0)
+    signal.signal(signal.SIGINT, ctrl_c)
+    signal.signal(signal.SIGTERM, ctrl_c)
+
+    # Emergency shutdown after SIGUSR2. Tear down resources and quit.
+    def wipeout(signum, stack):
+            logline(1, 'Commencing self-wipeout..')
+            end(112)
+    signal.signal(signal.SIGUSR2, wipeout)
+
+    # signal to force update all (useful e.g. after template or config file change)
+    def run_update_conf(signum, stack):
+        logline(1, 'SIGUSR1 received. Forcing reload of everything.')
+        read_my_config()
+        init_nodelist()
+    signal.signal(signal.SIGUSR1, run_update_conf)
+
+    # alarm triggered = run reload_command NOW:
+    def alarm_run_reload_command(signum, stack):
+        run_reload_command()
+    signal.signal(signal.SIGALRM, alarm_run_reload_command)
+
+def init_zk():
+    global zk
+    try:
+        logline(2, 'Initializing connect to zookeeper (%s)' % getconf('zk_servers'))
+        zk = KazooClient(hosts=getconf('zk_servers'), read_only=True, timeout=int(getconf('zk_timeout')))
+        zk.start()
+    #except TimeoutError:   # before kazoo v2.1
+    except KazooTimeoutError:
+            logline(0, 'ZK connect failed.')
+            end(2)
+
+    # add state watch
+    # (will not trigger on first init (because it already happened (to get zk handle)), only on connection changes)
+    def state_watcher(state):
+        logline(1, 'ZK connection state change -> ' + state)
+        if state == KazooState.LOST:
+            # we're done.. all ephemeral nodes are lost.. call cleanup of resources
+            # fortunately, we don't create any nodes, so we'll just wait for connection to go up
+            logline(1, 'Connection definitively lost..')
+        elif state == KazooState.SUSPENDED:
+            # Handle being disconnected from Zookeeper.
+            logline(1, 'ZK connection interrupted. Retrying.')
+            # entering safe mode, anything can happen during the "blind" period and we won't know about it
+        else:
+            # Handle being connected/reconnected to Zookeeper.
+            logline(1, 'Connected to ZK. Updating nodelist.')
+            # Make full refresh of ZK tree.
+            # non-blocking call required:
+            init_nodelist()
+
+    zk.add_listener(state_watcher)
+
+
+def normalize_pushenv(string):
+    try:
+        return dict(x.split(':') for x in re.sub(r' *([:,]) *', r'\1', string).split(',') if x)
+    except ValueError:
+        logline(0, 'Error parsing pushenv variable in cfg file (%s)' % string)
+        harakiri()
+
+def generate_confs():
+    if not CURRENT_ZK_VIEW:
+        logline(1, 'Final list of services passed to templating engine is empty. Not generating config (it would be empty anyway). Check includepath_regex/excludepath_regex or zk_watch_paths config parameters.')
+        return
+    FILESECTIONS = config.sections()
+    FILESECTIONS.remove('main')
+    # whether it is needed to run reload_command (= have any conf file changed)
+    RUN_RELOAD = False
+    for FILESECTION in FILESECTIONS:
+        logline(3, 'Processing section "%s"' % FILESECTION)
+        CFG_TEMPLATEFILE = getconf('infile', FILESECTION)
+        CFG_OUT = getconf('outfile', FILESECTION)
+        CFG_PUSHENV = normalize_pushenv(getconf('PUSHENV', FILESECTION))
+        try:
+            with open(CFG_TEMPLATEFILE, 'r') as f:
+                templatext = f.read()
+        except IOError as e:
+            logline(0, "Cannot open template file " + CFG_TEMPLATEFILE + " (" + str(e) + "). Exiting gracefully")
+            os.kill(os.getpid(), signal.SIGUSR2)
+
+        includepath = excludepath = False
+        try:
+            if item_is_in_config('includepath_regex', FILESECTION):
+                includepath = re.compile(getconf('includepath_regex', FILESECTION))
+        except:
+            logline(0, 'Invalid regex in includepath_regex, section [%s]' % FILESECTION)
+            harakiri()
+            gevent.sleep(0)
+            return
+        try:
+            if item_is_in_config('excludepath_regex', FILESECTION):
+                excludepath = re.compile(getconf('excludepath_regex', FILESECTION))
+        except:
+            logline(0, 'Invalid regex in excludepath_regex, section [%s]' % FILESECTION)
+            harakiri()
+            gevent.sleep(0)
+            return
+
+        TMP_ZK_VIEW = OrderedDict()
+        if not includepath and not excludepath:
+            # make local copy of zk tree view so we can customize it for current section
+            TMP_ZK_VIEW = copy.deepcopy(CURRENT_ZK_VIEW)
+        else:
+            # make local copy by copying in/excluded elements
+            for SEARCH_BASE in sorted(CURRENT_ZK_VIEW):
+                for svctype in sorted(CURRENT_ZK_VIEW[SEARCH_BASE]):
+                    path2match = '%s/%s' % (SEARCH_BASE, svctype)
+                    if includepath and includepath.match(path2match):
+                        if excludepath and excludepath.match(path2match):
+                            logline(4, 'Excluding path: ' + path2match)
+                        else:
+                            logline(4, 'Matched path: ' + path2match)
+                            # update TMP_ZK_VIEW
+                            if SEARCH_BASE not in TMP_ZK_VIEW:
+                                TMP_ZK_VIEW.update(OrderedDict({SEARCH_BASE:OrderedDict()}))
+                            TMP_ZK_VIEW[SEARCH_BASE][svctype] = CURRENT_ZK_VIEW[SEARCH_BASE][svctype]
+
+        # find all services without children and delete them from dict
+        if not getconf('include_empty'):
+            for searchbase in CURRENT_ZK_VIEW:
+                for svctype in CURRENT_ZK_VIEW[searchbase]:
+                    if len(CURRENT_ZK_VIEW[searchbase][svctype]) == 0:
+                        # delete from temporary dict
+                        if svctype in TMP_ZK_VIEW[searchbase]:
+                            del TMP_ZK_VIEW[searchbase][svctype]
+
+        #logline(1, 'debug service view: %s' % TMP_ZK_VIEW['/dev/service']['teller'])
+        if CURRENT_ZK_VIEW and not TMP_ZK_VIEW:
+            logline(1, 'Config file section [%s]: Final list of services passed to templating engine is empty. Check include/excludepath_regex. Not writing output file %s' % (FILESECTION, CFG_OUT))
+            return
+
+        # RUN TEMPLATING:
+        #def datetimeformat(value, format='%H:%M:%s  %d-%m-%Y'):
+        #    return value.strftime(format)
+        #e.filters['datetimeformat'] = datetimeformat
+        try:
+            t = Template(templatext)
+            conf_new = t.render(ZK_TREE=TMP_ZK_VIEW, PUSHENV=CFG_PUSHENV)
+        except jinja2.exceptions.TemplateSyntaxError as te:
+            logline(0, 'Syntax error in jinja template file %s on line %s: %s' %(CFG_TEMPLATEFILE, te.lineno, str(te)))
+            logline(1, 'Aborting file generation')
+            return
+        except jinja2.exceptions.TemplateError as te:
+            logline(0, 'Jinja template render error in file ' + CFG_TEMPLATEFILE + ': ' + str(te))
+            logline(1, 'Aborting file generation')
+            return
+
+        # find out if the new config differs (no need to write if hasn't changed)
+        try:
+            if os.access(CFG_OUT, os.R_OK):
+                f = open(CFG_OUT, 'r')
+                conf_old = f.read()
+                f.close()
+            else:
+                # file doesn't exist, use empty value for diffs
+                conf_old = ''
+
+            if conf_old == conf_new:
+                # no change
+                logline(2, "Unchanged: " + CFG_OUT)
+            else:
+                # cfg has changed. Show diff (if outfile not empty), write new cfg file and run reload.
+                if conf_old:
+                    OLDCFGNAME = CFG_OUT  + ' (oldconf)'
+                    NEWCFGNAME = CFG_OUT  + ' (newconf)'
+                    #stdout.writelines(difflib.unified_diff(conf_old.splitlines(1), conf_new.splitlines(1), fromfile=OLDCFGNAME, tofile=NEWCFGNAME))
+                    FILEDIFF = difflib.unified_diff(conf_old.splitlines(1), conf_new.splitlines(1), fromfile=OLDCFGNAME, tofile=NEWCFGNAME)
+                    # log the diff output if loglevel allows it
+                    for line in FILEDIFF:
+                        logline(3, line.rstrip())
+                logline(2, 'Writing config: ' + CFG_OUT)
+
+                f = open(CFG_OUT, 'w+')
+                f.write(conf_new)
+                f.close()
+                RUN_RELOAD = True
+        except IOError as e:
+            logline(0, "Cannot open file " + CFG_OUT + " (" + str(e) + "). Exiting gracefully")
+            harakiri()
+
+    if RUN_RELOAD:
+        schedule_run_reload_command()
+    else:
+        logline(2, 'Not running reload_command.')
+
+def schedule_run_reload_command():
+    global RELOAD_SCHEDULED
+    global RELOAD_NEEDED
+    if RELOAD_RUNNING:
+        logline(3, 'Reload still running. We\'ll run it again.')
+        #logline(3, 'RELOAD_NEEDED -> True (was %s)' % str(RELOAD_NEEDED))
+        RELOAD_NEEDED = True
+        return
+    if RELOAD_SCHEDULED:
+        logline(3, 'Reload already scheduled.')
+        return
+
+    if getconf('wait_before_reload'):
+        logline(3, 'Scheduling reload_command in %i seconds.' % getconf('wait_before_reload'))
+        signal.alarm(getconf('wait_before_reload'))
+        #logline(3, 'RELOAD_SCHEDULED -> True')
+        RELOAD_SCHEDULED = True
+    else:
+        # run immediately
+        run_reload_command()
+
+def run_reload_command():
+    # if there are some unfinished ZK refresh calls, wait them to finish:
+    while scheduled_calls_count:
+        logline(3, 'Waiting 1s for all ZK calls to finish (currently %i)' % scheduled_calls_count)
+        gevent.sleep(1)
+
+    def printoutput(severity, msg, header_msg=''):
+        if msg:
+            if header_msg:
+                logline(severity, header_msg)
+            for line in msg.splitlines():
+                logline(severity, line)
+
+    global RELOAD_SCHEDULED
+    global RELOAD_RUNNING
+    global RELOAD_NEEDED
+    try:
+        CHECKCONF_OK = True
+        if item_is_in_config('checkconf_command'):
+            CHECKCONFCMD = getconf('checkconf_command')
+            timeout_command = getconf('timeout_command')
+            if timeout_command:
+                # timeout enabled, let's set it up
+                timeout = int(getconf('reload_command_timeout'))
+                CHECKCONFCMD = '%s -k %i %i %s' % (timeout_command, timeout, timeout, CHECKCONFCMD)
+            logline(2, 'Running checkconf command: ' + CHECKCONFCMD)
+            #else:
+            #    # drop stdout
+            # TODO: pipe cmd output to info loglevel
+            #    CHECKCONFCMD += ' > /dev/null'
+            try:
+                process = subprocess.Popen(shlex.split(CHECKCONFCMD), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout, stderr = process.communicate()
+                proc_retval = process.wait()
+                if proc_retval:
+                    if timeout_command and proc_retval == 124:
+                        # timeout reached
+                        logline(1, 'Checkconf command timed out after %i seconds and was killed.' % int(getconf('reload_command_timeout')))
+                    # command returned non-zero
+                    logline(1, 'Checkconf command failed, not reloading!')
+                    checkCONF_OK = False
+                    printoutput(1, stdout, 'Checkconf command STDOUT:')
+                    printoutput(1, stderr, 'Checkconf command STDERR:')
+                else:
+                    logline(3, 'Checkconf command completed successfully')
+                    printoutput(4, stdout, 'Checkconf command STDOUT:')
+                    printoutput(4, stderr, 'Checkconf command STDERR:')
+            #except (OSError, ValueError) as e:
+            except:
+                logline(1, 'Checkconf command failed with message: %s' % traceback.format_exception(*exc_info()))
+                CHECKCONF_OK = False
+
+        if CHECKCONF_OK:
+            if item_is_in_config('reload_command'):
+                RELOADCMD = getconf('reload_command')
+                timeout_command = getconf('timeout_command')
+                if timeout_command:
+                    # timeout enabled, let's set it up
+                    timeout = int(getconf('reload_command_timeout'))
+                    RELOADCMD = '%s -k %i %i %s' % (timeout_command, timeout, timeout, RELOADCMD)
+                #logline(3, 'RELOAD_NEEDED, RELOAD_RUNNING -> True')
+                RELOAD_RUNNING = True
+                RELOAD_NEEDED = True
+                # run reloads until no other reload is needed (no files changed during the last reload run)
+                while RELOAD_NEEDED:
+                    logline(2, 'Running reload command: ' + RELOADCMD)
+                    #logline(3, 'RELOAD_NEEDED -> False')
+                    RELOAD_NEEDED = False
+                    #try:   (will be handled by generic exception catch later
+                    process = subprocess.Popen(shlex.split(RELOADCMD), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    stdout, stderr = process.communicate()
+                    proc_retval = process.wait()
+
+                    #except OSError, ValueError as e:
+                    #    logline(1, 'Reload command failed with message: %s' % traceback.format_exception(*exc_info()))
+
+                    #if os.system(RELOADCMD):
+                    if proc_retval:
+                        if timeout_command and proc_retval == 124:
+                            # timeout reached, process exited itself after TERM
+                            logline(1, 'Reload command timed out after %i seconds and was killed.' % int(getconf('reload_command_timeout')))
+                        elif timeout_command and proc_retval == 137:
+                            # timeout reached, process did not exit after TERM and was killed using KILL
+                            logline(1, 'Reload command timed out and additionaly did not respond to TERM. Killed using KILL signal.')
+                        else:
+                            logline(1, 'Reload command FAILED!')
+                        printoutput(1, stdout, 'Reload command STDOUT:')
+                        printoutput(1, stderr, 'Reload command STDERR:')
+                    else:
+                        logline(2, 'Reload command finished successfully')
+                        printoutput(3, stdout, 'Reload command STDOUT:')
+                        printoutput(2, stderr, 'Reload command STDERR:')
+                    if not stdout and not stderr:
+                        logline(3, 'Reload command did not print anything')
+
+                #logline(3, 'RELOAD_RUNNING -> False')
+                RELOAD_RUNNING = False
+            else:
+                logline(2, "Reload command not defined, not reloading.")
+        #logline(3, 'RELOAD_SCHEDULED -> False')
+        RELOAD_SCHEDULED = False
+        if RELOAD_NEEDED:
+            # this should never happen, but with this async stuff.. one never knows
+            #logline(3, 'RELOAD_NEEDED (this should never happen) -> False')
+            RELOAD_NEEDED = False
+            logline(2, 'Re-running reload')
+            schedule_run_reload_command()
+    except Exception as e:
+        import traceback
+        logline(1, 'Error running reload command (Reason: %s)' % traceback.format_exception(*exc_info()))
+        #logline(3, 'After exception: RELOAD_NEEDED, RELOAD_NEEDED, RELOAD_RUNNING -> False')
+        RELOAD_SCHEDULED = False
+        RELOAD_NEEDED = False
+        RELOAD_RUNNING = False
+
+# returns full path of the program or None if not found on PATH
+def find_executable_in_path(program):
+    import os
+    def is_exe(fpath):
+        return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+
+    fpath, fname = os.path.split(program)
+    if fpath:
+        if is_exe(program):
+            return program
+    else:
+        for path in os.environ["PATH"].split(os.pathsep):
+            path = path.strip('"')
+            exe_file = os.path.join(path, program)
+            if is_exe(exe_file):
+                return exe_file
+
+    return None
+def parse_event_path(event_path):
+    if event_path in getconf('zk_watch_paths'):
+        # it is base path itself, no need to search for services
+        return {'SEARCH_BASE':event_path, 'svcname':''}
+    # search which service triggered the watch
+    matched_basepath = ''
+    svcname = ''
+    for basepath in getconf('zk_watch_paths'):
+        if event_path.startswith(basepath+'/'):
+            matched_basepath += basepath
+            svcname = event_path[len(basepath)+1:]  # filter out basepath + /
+            break
+    return {'SEARCH_BASE':matched_basepath, 'svcname':svcname}
+    
+def servicelist_has_changed(event):
+    result = parse_event_path(event.path)
+    #logline(5, 'Triggered event raw data: ' + str(result))
+    SEARCH_BASE = result['SEARCH_BASE']
+    svcname = result['svcname']
+    if not svcname:
+        logline(2, 'Service list has changed in path %s. Running full ZK tree refresh and updating outfiles.' % SEARCH_BASE)
+    else:
+        logline(3, 'Instance list has changed (trigger: %s; basepath: %s; svcname: %s). Updating outfiles.' % (event.path, SEARCH_BASE, svcname))
+    schedule_refresh_zk_view(SEARCH_BASE, svcname)
+
+def get_svcinstance_data(SEARCH_BASE, svcname, svcinst):
+    INST_PATH = SEARCH_BASE + '/' + svcname + '/' + svcinst
+    INST_DATA_RAW = zk.get(INST_PATH)
+    return json.loads(INST_DATA_RAW[0])
+
+def update_instancelist(SVC_INSTANCES, SEARCH_BASE, svcname):
+    new_instances = OrderedDict()
+    for svcinst in SVC_INSTANCES:
+        svcinst_data = get_svcinstance_data(SEARCH_BASE, svcname, svcinst)
+        new_instances.update({svcinst:svcinst_data})
+    update_local_zk_tree(SEARCH_BASE, svcname, new_instances)
+
+def refresh_zk_view(async_obj, SEARCH_BASE, svcname):
+    global scheduled_calls_count
+    scheduled_calls_count -= 1
+    logline(5, 'scheduled_calls_count %i' % scheduled_calls_count)
+
+    try:
+        if svcname:
+            # we're getting list of instances from ONE service
+            SVC_INSTANCES = async_obj.get()
+            update_instancelist(SVC_INSTANCES, SEARCH_BASE, svcname)
+        else:
+            # we're getting list of service types. We need to iterate them all to get all instances.
+            svclist = async_obj.get()
+            for svcname in sorted(svclist):
+                schedule_refresh_zk_view(SEARCH_BASE, svcname)
+
+    except ConnectionLossException:
+        logline(1, "Connection lost during getting node list from zk!")
+    except NoNodeError:
+        logline(2, 'ZK node does not exist: %s' % SEARCH_BASE)
+        logline(2, 'Rescheduling full ZK tree refresh')
+        init_nodelist()
+        return
+    except KazooException:
+        logline(1, "Error getting data for node %s" % SEARCH_BASE)
+        logline(1, 'Rescheduling full ZK tree refresh')
+        init_nodelist()
+        #end(2)
+        return
+
+    if not scheduled_calls_count:
+        # all scheduled ZK async calls are finished
+        logline(5, 'RAW ZK TREE DUMP: %s' % str(CURRENT_ZK_VIEW))
+        logline(2, 'Calling cfg update')
+        # Non-async call. No ZK commands/state changes will be processed until this function finishes.
+        # But this call is more important anyway (we already have actual ZK tree state locally).
+        # It is desirable to write all configs NOW.
+        generate_confs()
+
+
+#def get_svclist_result(async_obj):
+#    try:
+#        SVC_INSTANCES = async_obj.get()
+#        ZK_BASE="/"+ZK_ENV+"/service"
+#        SVCLIST={}
+#        for SVC in SVC_INSTANCES:
+#            SVCLIST[SVC] = {}
+#            SVC_INST = zk.get_children(ZK_BASE+'/'+SVC, watch=servicelist_has_changed)
+#            for INST in SVC_INST:
+#                INST_DATA = zk.get(ZK_BASE+'/'+SVC+'/'+INST)
+#                SVC_INFO = json.loads(INST_DATA[0])
+#                #logline(SVC_INFO)
+#                SVC_IP = SVC_INFO['address']
+#                SVC_PORT = SVC_INFO['port']
+#                SVC_REGTIME = SVC_INFO['registrationTimeUTC']
+#                SVC_REGTIME_STR = datetime.datetime.fromtimestamp(int(SVC_REGTIME)/1000.0).strftime('%Y-%m-%d %H:%M:%S')
+#                #if VERBOSE:
+#                #    logline('%s port:%s registered at %s (%s)' % (SVC_IP, SVC_PORT, SVC_REGTIME_STR, SVC))
+#                SVCLIST[SVC].update({INST: {'address': SVC_IP, 'port': SVC_PORT, 'regtime': SVC_REGTIME_STR}})
+#        if not INCLUDE_EMPTY:
+#            # find all services without children and delete them from dict
+#            for emptysvc in [i for i in SVCLIST.keys() if len(SVCLIST[i]) == 0]:
+#                del SVCLIST[emptysvc]
+#        if VERBOSE:
+#            logline('Raw SVCLIST: ' + str(SVCLIST))
+#        generate_confs(SVCLIST)
+#
+#    except ConnectionLossException:
+#        logline("Connection lost during getting node list from zk!")
+#    except KazooException:
+#        logline("General failure :)")
+#        end(2)
+    
+# Non-blocking call. Adds asynchronous callback and returns immediately.
+# TODO: osetrit NoNodeError a ostatne ZK exceptions
+def schedule_refresh_zk_view(SEARCH_BASE, svcname=''):
+    # create callback
+    def register_callback(async_obj_orig, SEARCH_BASE, svcname=''):
+        def callback(async_obj_returned):
+            logline(4, 'Callback called. SEARCH_BASE: %s; svcname: %s' % (SEARCH_BASE, svcname))
+            refresh_zk_view(async_obj_returned, SEARCH_BASE, svcname)
+        async_obj_orig.rawlink(callback)    # add callback
+
+    global scheduled_calls_count
+    if svcname:
+        # schedule refresh of instance list of ONE service
+        scheduled_calls_count += 1
+        logline(5, 'scheduled_calls_count %i' % scheduled_calls_count)
+        SEARCH_IN = SEARCH_BASE + '/' + svcname
+        async_obj = zk.get_children_async(SEARCH_IN, watch=servicelist_has_changed)
+        register_callback(async_obj, SEARCH_BASE, svcname)
+    else:
+        # schedule refresh of instance list of all services in SEARCH_BASE
+        scheduled_calls_count += 1
+        logline(5, 'scheduled_calls_count %i' % scheduled_calls_count)
+        SEARCH_IN = SEARCH_BASE
+        async_obj = zk.get_children_async(SEARCH_IN, watch=servicelist_has_changed)
+        register_callback(async_obj, SEARCH_BASE, svcname)
+
+def refresh_svcinstance_view(SEARCH_BASE, svcname=''):
+    logline(2, 'Getting list of service instances (base: %s).' % SEARCH_BASE)
+    async_obj = zk.get_children_async(SEARCH_BASE+'/'+str(svcname), watch=instancelist_has_changed)
+    async_obj.rawlink(get_instancelist_result)   # add callback
+def refresh_svclist_view(SEARCH_BASE):
+    logline(2, 'Getting list of all services (base: %s).' % SEARCH_BASE)
+    async_obj = zk.get_children_async(SEARCH_BASE, watch=servicelist_has_changed)
+    async_obj.rawlink(get_svclist_result)   # add callback
+#def generate_config():
+#    if VERBOSE:
+#        logline('Getting list of services.')
+#    ZK_BASE="/"+ZK_ENV+"/service"
+#    async_obj = zk.get_children_async(ZK_BASE, watch=servicelist_has_changed)
+#    async_obj.rawlink(get_svclist_result)   # add callback
+
+
+def update_local_zk_tree(zkbase, svcname, new_instances):
+    global CURRENT_ZK_VIEW
+    if zkbase not in CURRENT_ZK_VIEW:
+        CURRENT_ZK_VIEW.update(OrderedDict({zkbase:OrderedDict()}))
+    CURRENT_ZK_VIEW[zkbase][svcname] = new_instances
+
+def init_nodelist():
+    # test for presence of all ZK_WATCH_PATHSs
+    try:
+        for path in getconf('zk_watch_paths'):
+            if zk.exists(path) == None:
+                logline(0, 'ZK path "%s" does not exist! Please check "zk_watch_paths" cfg parameter. Exiting.' % path)
+                harakiri()
+    except Exception:
+        logline(0, 'Problem checking ZK paths! (Message: %s). Exiting.' % traceback.format_exception(*exc_info()))
+        harakiri()
+
+    global CURRENT_ZK_VIEW
+    CURRENT_ZK_VIEW = OrderedDict()
+    for SVCROOT in getconf('zk_watch_paths'):
+        schedule_refresh_zk_view(SVCROOT, '')
+
+    # watch ZK_WATCH_PATHS nodes:
+    #@zk.ChildrenWatch(ZKPATH)
+    #def watch_root_children(children):
+    #    logline("Root nodes are now: %s" % children)
+
+
+######################################################################################################
+# MAIN 
+######################################################################################################
+
+read_my_config()
+init_logging()
+init_signals()
+init_zk()
+logline(2, 'Program initialized successfully')
+init_nodelist() # initialize local ZK tree view and set all watches
+
+while True:
+    gevent.sleep(3600)
+    try:
+        zk.exists('/')
+        logline(3, " -- Mark --")
+    except:
+        logline(1, 'Periodic ZK check error: cannot read data from zookeeper!')
+
+# program is ending using signals
