@@ -54,11 +54,11 @@ Simply from the command line:
 ```
 /usr/bin/zkconfgen
 ```
-Or with custom config:
+Or with custom config and logfile:
 ```
-/usr/bin/zkconfgen -c /etc/zkconfgen/zkconfgen.ini
+/usr/bin/zkconfgen -c /etc/zkconfgen/zkconfgen.ini -l /tmp/zkconfgen.log
 ```
-Or to see what options from config can be overriden:
+Or to see what options from config can be overrided:
 ```
 /usr/bin/zkconfgen -h
 ```
@@ -200,7 +200,7 @@ the functionality to whatever is needed. Currently, the zkconfgen understands on
 ```
 /<zk_watch_path>/<svc_name>/<instances_with_data>
 ```
-so it expects to find instances (and most importantly - json encoded node data) on the second level of the Zookeeper tree under zk_watch_paths. It there exists other schema that cannot fit
+so it expects to find instances (and most importantly - json encoded node data) on the second level of the Zookeeper tree under zk_watch_paths. If there exists other schema that cannot fit
 (e.g. instance list right on the first level) or the instance node data is not in json format, then another config option will need to be added to cover it.
 If such need arise, you can contact me. 
 Or create a pull request :).
