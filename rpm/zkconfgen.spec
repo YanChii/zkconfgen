@@ -13,6 +13,8 @@ BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
 Requires: python-kazoo
 Requires: python-gevent
 Requires: python-configparser
+Requires: python-jinja2
+Requires: python-six
 
 %description
 Generate configuration files (for nginx, apache, haproxy, etc.) from Zookeeper registered services using file templates. This program watches for changes in Zookeeper (using triggers), immediately re-generates all defined output config files and calls specified reload command to apply the new configuration.
