@@ -45,6 +45,9 @@ And if you have systemd:
 ```
 cp zkconfgen.service /etc/systemd/system/zkconfgen.service
 systemctl daemon-reload
+
+Or you can use RPM made for Centos 7 in the rpm/ directory.
+Or build your own rpm using .spec file.
 ```
 How to run it
 ==================
