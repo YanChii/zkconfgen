@@ -603,9 +603,15 @@ def refresh_zk_view(async_obj, SEARCH_BASE, svcname):
     except ConnectionLossException:
         logline(1, "Connection lost during getting node list from zk!")
     except NoNodeError:
-        logline(2, 'ZK node does not exist: %s' % SEARCH_BASE)
-        logline(2, 'Rescheduling full ZK tree refresh')
-        init_nodelist()
+        if svcname:
+            # the error is in getting instance name (and svcname is not present).. we need to redownload all svc names
+            logline(2, 'ZK node does not exist: %s' % SEARCH_BASE)
+            logline(2, 'Rescheduling full ZK tree refresh')
+            init_nodelist()
+        else:
+            # in this case, there was error in listing one of zk_watch_paths. It either disappeared or never existed.
+            logline(1, 'ZK node does not exist: %s' % SEARCH_BASE)
+            logline(1, 'Please check ini parameter "zk_watch_paths"')
         return
     except KazooException:
         logline(1, "Error getting data for node %s" % SEARCH_BASE)
@@ -624,39 +630,6 @@ def refresh_zk_view(async_obj, SEARCH_BASE, svcname):
         generate_confs()
 
 
-#def get_svclist_result(async_obj):
-#    try:
-#        SVC_INSTANCES = async_obj.get()
-#        ZK_BASE="/"+ZK_ENV+"/service"
-#        SVCLIST={}
-#        for SVC in SVC_INSTANCES:
-#            SVCLIST[SVC] = {}
-#            SVC_INST = zk.get_children(ZK_BASE+'/'+SVC, watch=servicelist_has_changed)
-#            for INST in SVC_INST:
-#                INST_DATA = zk.get(ZK_BASE+'/'+SVC+'/'+INST)
-#                SVC_INFO = json.loads(INST_DATA[0])
-#                #logline(SVC_INFO)
-#                SVC_IP = SVC_INFO['address']
-#                SVC_PORT = SVC_INFO['port']
-#                SVC_REGTIME = SVC_INFO['registrationTimeUTC']
-#                SVC_REGTIME_STR = datetime.datetime.fromtimestamp(int(SVC_REGTIME)/1000.0).strftime('%Y-%m-%d %H:%M:%S')
-#                #if VERBOSE:
-#                #    logline('%s port:%s registered at %s (%s)' % (SVC_IP, SVC_PORT, SVC_REGTIME_STR, SVC))
-#                SVCLIST[SVC].update({INST: {'address': SVC_IP, 'port': SVC_PORT, 'regtime': SVC_REGTIME_STR}})
-#        if not INCLUDE_EMPTY:
-#            # find all services without children and delete them from dict
-#            for emptysvc in [i for i in SVCLIST.keys() if len(SVCLIST[i]) == 0]:
-#                del SVCLIST[emptysvc]
-#        if VERBOSE:
-#            logline('Raw SVCLIST: ' + str(SVCLIST))
-#        generate_confs(SVCLIST)
-#
-#    except ConnectionLossException:
-#        logline("Connection lost during getting node list from zk!")
-#    except KazooException:
-#        logline("General failure :)")
-#        end(2)
-    
 # Non-blocking call. Adds asynchronous callback and returns immediately.
 # TODO: osetrit NoNodeError a ostatne ZK exceptions
 def schedule_refresh_zk_view(SEARCH_BASE, svcname=''):
@@ -706,16 +679,6 @@ def update_local_zk_tree(zkbase, svcname, new_instances):
     CURRENT_ZK_VIEW[zkbase][svcname] = new_instances
 
 def init_nodelist():
-    # test for presence of all ZK_WATCH_PATHSs
-    try:
-        for path in getconf('zk_watch_paths'):
-            if zk.exists(path) == None:
-                logline(0, 'ZK path "%s" does not exist! Please check "zk_watch_paths" cfg parameter. Exiting.' % path)
-                harakiri()
-    except Exception:
-        logline(0, 'Problem checking ZK paths! (Message: %s). Exiting.' % traceback.format_exception(*exc_info()))
-        harakiri()
-
     global CURRENT_ZK_VIEW
     CURRENT_ZK_VIEW = OrderedDict()
     for SVCROOT in getconf('zk_watch_paths'):
