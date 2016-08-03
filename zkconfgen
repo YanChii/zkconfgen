@@ -416,9 +416,13 @@ def schedule_run_reload_command():
 
 def run_reload_command():
     # if there are some unfinished ZK refresh calls, wait them to finish:
-    while scheduled_calls_count:
-        logline(3, 'Waiting 1s for all ZK calls to finish (currently %i)' % scheduled_calls_count)
-        gevent.sleep(1)
+    # DISABLED because it was causing
+        # AssertionError: Impossible to call blocking function in the event loop callback
+    #while scheduled_calls_count:
+    #    logline(3, 'Waiting 1s for all ZK calls to finish (currently %i)' % scheduled_calls_count)
+    #    gevent.sleep(1)
+    if scheduled_calls_count:
+        logline(3, 'FYI: Another ZK calls are still running (currently %i)' % scheduled_calls_count)
 
     def printoutput(severity, msg, header_msg=''):
         if msg:
