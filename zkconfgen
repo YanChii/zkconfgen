@@ -322,8 +322,8 @@ def generate_confs():
                             logline(4, 'Matched path: ' + path2match)
                             # update TMP_ZK_VIEW
                             if SEARCH_BASE not in TMP_ZK_VIEW:
-                                TMP_ZK_VIEW.update(OrderedDict({SEARCH_BASE:OrderedDict()}))
-                            TMP_ZK_VIEW[SEARCH_BASE][svctype] = CURRENT_ZK_VIEW[SEARCH_BASE][svctype]
+                                TMP_ZK_VIEW[SEARCH_BASE] = OrderedDict()
+                            TMP_ZK_VIEW[SEARCH_BASE][svctype] = copy.deepcopy(CURRENT_ZK_VIEW[SEARCH_BASE][svctype])
 
         # find all services without children and delete them from dict
         if not getconf('include_empty'):
@@ -331,7 +331,7 @@ def generate_confs():
                 for svctype in CURRENT_ZK_VIEW[searchbase]:
                     if len(CURRENT_ZK_VIEW[searchbase][svctype]) == 0:
                         # delete from temporary dict
-                        if svctype in TMP_ZK_VIEW[searchbase]:
+                        if searchbase in TMP_ZK_VIEW and svctype in TMP_ZK_VIEW[searchbase]:
                             del TMP_ZK_VIEW[searchbase][svctype]
 
         #logline(1, 'debug service view: %s' % TMP_ZK_VIEW['/dev/service']['teller'])
